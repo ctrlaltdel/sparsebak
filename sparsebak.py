@@ -32,19 +32,20 @@ class ArchiveSet:
         self.vols = {}
         for key in cp["volumes"]:
             if cp["volumes"][key] != "disable":
-                self.vols[key] = self.Volume(key, self.path)
-                self.vols[key].enabled = True
                 os.makedirs(pjoin(self.path,key), exist_ok=True)
+                self.vols[key] = self.Volume(key, self.path, self.vgname)
+                self.vols[key].enabled = True
                 self.vols[key].present = True
 
-        fs_vols = [e.name for e in os.scandir(self.path) if e.is_dir()
-                   and e.name not in self.vols.keys()]
-        for key in fs_vols:
-            self.vols[key] = self.Volume(key, self.path)
+        #fs_vols = [e.name for e in os.scandir(self.path) if e.is_dir()
+        #           and e.name not in self.vols.keys()]
+        #for key in fs_vols:
+        #    self.vols[key] = self.Volume(key, self.path, self.vgname)
         
     class Volume:
-        def __init__(self, name, path):
-            self.present = os.path.exists(pjoin(path,name))
+        def __init__(self, name, path, vgname):
+            self.present = lv_exists(vgname, name)
+            #self.mapped = os.path.exists(####
             self.sessions ={e.name: self.Ses(e.name,pjoin(path,name)) for e \
                 in os.scandir(pjoin(path,name)) if e.name[:2]=="S_" \
                     and e.name[-3:]!="tmp"} if self.present else {}
@@ -209,6 +210,16 @@ def lv_exists(vgname, lvname):
         return True
 
 
+def vg_exists(vgname):
+    try:
+        p = subprocess.check_output( ["vgdisplay", vgname],
+                                    stderr=subprocess.STDOUT )
+    except:
+        return False
+    else:
+        return True
+
+
 # Load lvm metadata
 def get_lvm_metadata():
     print("\nScanning volume metadata...")
@@ -246,8 +257,8 @@ def get_lvm_metadata():
             volume = devid = ""
 
 
-def get_lvm_size(vol):
-    line = subprocess.check_output( ["lvdisplay --units=b " + vgname+"/"+vol
+def get_lvm_size(volpath):
+    line = subprocess.check_output( ["lvdisplay --units=b " + volpath
         +  " | grep 'LV Size'"], shell=True).decode("UTF-8").strip()
 
     size = int(re.sub("^.+ ([0-9]+) B", r'\1', line))
@@ -368,7 +379,13 @@ def get_sessions(datavol):
 
 # Send volume to destination:
 
-def send_volume(datavol):
+def send_volume(datavol, tarf):
+    # var ref optimizations
+    l_chunksize = bkchunksize
+    volsize = snap2size
+    bmsize = bmap_size
+    chunksizediff = volsize-l_chunksize
+
     if not os.path.exists(bkdir+"/"+datavol):
         os.makedirs(bkdir+"/"+datavol)
     sessions = get_sessions(datavol)
@@ -377,7 +394,8 @@ def send_volume(datavol):
     # Make new session folder
     sdir=bkdir+"/"+datavol+"/"+bksession
     os.makedirs(sdir+"-tmp")
-    zeros = bytes(bkchunksize)
+    zeros = bytes(l_chunksize)
+    empty = bytes(0)
     count = bcount = zcount = 0
     thetime = time.time()
     if send_all:
@@ -385,27 +403,17 @@ def send_volume(datavol):
         sendall_addr = 0
     else:
         # beyond range; send all is off
-        sendall_addr = snap2size + 1
+        sendall_addr = volsize + 1
 
     # Check volume size vs prior backup session
     if len(sessions) > 0 and not send_all:
         prior_size = get_info_vol_size(datavol)
-        next_chunk_addr = last_chunk_addr(prior_size, bkchunksize) + bkchunksize
-        if prior_size > snap2size:
+        next_chunk_addr = last_chunk_addr(prior_size, l_chunksize) + l_chunksize
+        if prior_size > volsize:
             print("  Volume size has shrunk.")
-        elif snap2size-1 >= next_chunk_addr:
+        elif volsize-1 >= next_chunk_addr:
             print("  Volume size has increased.")
             sendall_addr = next_chunk_addr
-
-    # Use tar to stream files to destination
-    stream_started = False
-    if options.tarfile:
-        # don't untar at destination
-        untar_cmd = ["cd '"+pjoin(destmountpoint,destdir)
-                    +"' && mkdir -p ."+sdir+"-tmp"
-                    +" && cat >."+pjoin(sdir+"-tmp",bksession+".tar")]
-    else:
-        untar_cmd = ["cd '"+pjoin(destmountpoint,destdir)+"' && tar -xf -"]
 
     # Open source volume and its delta bitmap as r, session manifest as w.
     with open(pjoin("/dev",vgname,snap2vol),"rb") as vf:
@@ -413,54 +421,53 @@ def send_volume(datavol):
             bmap_mm = bytes(1) if send_all else mmap.mmap(bmapf.fileno(), 0)
             with open(sdir+"-tmp/manifest", "w") as hashf:
 
+                # function optimizations
+                vfseek = vf.seek
+                vfread = vf.read
+                zcompress = gzip.compress
+                sha256 = hashlib.sha256
+                BytesIO = io.BytesIO
+                tarf_addfile = tarf.addfile
+                TarInfo = tarfile.TarInfo
+                fmtstatus = " {:.1%} {:d} {}".format
+
+
                 # Cycle over range of addresses in volume.
-                for addr in range(0, snap2size, bkchunksize):
+                for addr in range(0, volsize, l_chunksize):
 
                     # Calculate corresponding position in bitmap.
-                    bmap_pos = addr // bkchunksize // 8
-                    b = (addr // bkchunksize) % 8
+                    bmap_pos = addr // l_chunksize // 8
+                    b = (addr // l_chunksize) % 8
 
                     # Should this chunk be sent?
                     if addr >= sendall_addr or bmap_mm[bmap_pos] & (2** b):
                         count += 1
-                        vf.seek(addr)
-                        buf = vf.read(bkchunksize)
-                        destfile = "x"+format(addr,"016x")
-                        print(" ",int(bmap_pos/bmap_size*100),"%  ",bmap_pos,
-                                destfile, end=" ")
+                        vfseek(addr)
+                        buf = vfread(l_chunksize)
+                        destfile = "x%016x" % addr
+                        print(fmtstatus(bmap_pos/bmsize,bmap_pos,
+                                destfile), end=" ")
 
                         # Compress & write only non-empty and last chunks
-                        if buf != zeros or addr >= snap2size-bkchunksize:
+                        if buf != zeros or addr >= chunksizediff:
                             # Performance fix: move compression into separate processes
-                            buf = gzip.compress(buf, compresslevel=4)
+                            buf = zcompress(buf, compresslevel=4)
                             bcount += len(buf)
-                            print(hashlib.sha256(buf).hexdigest(), destfile,
+                            print(sha256(buf).hexdigest(), destfile,
                                   file=hashf)
                             print(" DATA ", end="\x0d")
                         else: # record zero-length file
                             print("______", end="\x0d")
-                            buf = bytes(0)
+                            buf = empty
                             print(0, destfile, file=hashf)
                             zcount += 1
 
-                        # Start tar stream
-                        if not stream_started:
-                            print("Backing up to", (vmtype+"://"+destvm) if \
-                                destvm != None else destmountpoint)
-                            untar = subprocess.Popen(vm_run_args[vmtype]
-                                    + untar_cmd,
-                                    stdin=subprocess.PIPE,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-                            tarf = tarfile.open(mode="w|", fileobj=untar.stdin)
-                            stream_started = True
-
                         # Add buffer to stream
-                        tar_info = tarfile.TarInfo(sdir+"-tmp/"+destfile[1:-7]
-                                                       +"/"+destfile)
+                        tar_info = TarInfo("%s-tmp/%s/%s" % (sdir,
+                                            destfile[1:-7],destfile))
                         tar_info.size = len(buf)
                         tar_info.mtime = thetime
-                        tarf.addfile(tarinfo=tar_info, fileobj=io.BytesIO(buf))
+                        tarf_addfile(tarinfo=tar_info, fileobj=BytesIO(buf))
 
     # Send session info, end stream and cleanup
     if count > 0:
@@ -468,8 +475,8 @@ def send_volume(datavol):
 
         # Make info file and send with hashes
         with open(sdir+"-tmp/info", "w") as f:
-            print("volsize =", snap2size, file=f)
-            print("chunksize =", bkchunksize, file=f)
+            print("volsize =", volsize, file=f)
+            print("chunksize =", l_chunksize, file=f)
             print("chunks =", count, file=f)
             print("bytes =", bcount, file=f)
             print("zeros =", zcount, file=f)
@@ -483,19 +490,7 @@ def send_volume(datavol):
                     shutil.copyfileobj(f_in, f_out)
             tarf.add(sdir+"-tmp/deltamap.gz")
 
-        #print("Ending tar process ", end="")
-        tarf.close()
-        untar.stdin.close()
-        for i in range(10):
-            if untar.poll() != None:
-                break
-            time.sleep(1)
-        if untar.poll() == None:
-            time.sleep(5)
-            if untar.poll() == None:
-                untar.terminate()
-                print("terminated untar process!")
-                # fix: verify archive dir contents here
+        #tarf.flush()
 
         # Cleanup on VM/remote
         p = subprocess.check_output(vm_run_args[vmtype]+ \
@@ -517,8 +512,6 @@ def monitor_send(volumes=[], monitor_only=True):
     global snap1vol, snap2vol, map_exists, map_updated, mapfile, bksession
 
     bksession = time.strftime("S_%Y%m%d-%H%M%S")
-    print("\nStarting", ["backup","monitor-only"][monitor_only],
-        "session", [bksession,""][monitor_only])
 
     datavols, newvols \
     = prepare_snapshots()
@@ -528,6 +521,9 @@ def monitor_send(volumes=[], monitor_only=True):
     if monitor_only:
         newvols = []
         volumes = []
+    else:
+        print("\nStarting backup session", bksession)
+
 
     if len(datavols)+len(newvols) == 0:
         print("No new data.")
@@ -543,24 +539,65 @@ def monitor_send(volumes=[], monitor_only=True):
     if len(datavols) > 0:
         get_lvm_deltas()
 
+####
+    if not monitor_only:
+        print("Sending to backup destination", (vmtype+"://"+destvm) if \
+            destvm != None else destmountpoint)
+
+        # Use tar to stream files to destination
+        if options.tarfile:
+            # don't untar at destination
+            untar_cmd = ["cd '"+pjoin(destmountpoint,destdir)
+                        +"' && mkdir -p ."+sdir+"-tmp"
+                        +" && cat >."+pjoin(sdir+"-tmp",bksession+".tar")]
+        else:
+            untar_cmd = ["cd '"+pjoin(destmountpoint,destdir)+"' && tar -xf -"]
+
+        untar = subprocess.Popen(vm_run_args[vmtype]
+                + untar_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        tarf = tarfile.open(mode="w|", fileobj=untar.stdin)
+
     for datavol in datavols+newvols:
         print("\nProcessing Volume :", datavol)
         snap1vol = datavol + ".tick"
         snap2vol = datavol + ".tock"
-        snap1size = get_lvm_size(snap1vol)
-        snap2size = get_lvm_size(snap2vol)
+        snap1size = get_lvm_size(pjoin("/dev/",vgname,snap1vol))
+        snap2size = get_lvm_size(pjoin("/dev/",vgname,snap2vol))
         bmap_size = (snap2size // bkchunksize // 8) + 1
 
         mapfile = bkdir+"/"+datavol+".deltamap"
         map_exists, map_updated \
         = update_delta_digest()
 
+
+
         if not monitor_only:
             sent \
-            = send_volume(datavol)
+            = send_volume(datavol, tarf)
+
             finalize_bk_session(sent)
         else:
             finalize_monitor_session()
+
+####
+    #print("Ending tar process ", end="")
+    tarf.close()
+    untar.stdin.close()
+    for i in range(10):
+        if untar.poll() != None:
+            break
+        time.sleep(1)
+    if untar.poll() == None:
+        time.sleep(5)
+        if untar.poll() == None:
+            untar.terminate()
+            print("terminated untar process!")
+            # fix: verify archive dir contents here
+
+####
 
 
 def init_deltamap(bmfile):
@@ -821,13 +858,22 @@ with open("/tmp/sparsebak/receive.lst","rb") as list:
     if save_path:
         # Discard all data in destination if this is a block device
         # then open for writing
-        if os.path.exists(save_path) \
-        and stat.S_ISBLK(os.stat(save_path).st_mode):
-            if volsize > get_lvm_size(os.path.basename(save_path)):
+        if vg_exists(os.path.dirname(save_path)):
+            lv = os.path.basename(save_path)
+            vg = os.path.basename(os.path.dirname(save_path))
+            if not vg_exists(vg):
+                raise ValueError("Error parsing vg name from: "+save_path)
+            if not lv_exists(vg,lv):
+                # not possible to tell from path which thinpool to use
+                print("Please create LV before receiving.")
+                raise NotImplementedError("Automatic LV creation")
+            if volsize > get_lvm_size(save_path):
                 p = subprocess.check_output(["lvresize", "-L",str(volsize)+"b",
                                              "-f", save_path])
+        if os.path.exists(save_path) \
+        and stat.S_ISBLK(os.stat(save_path).st_mode):
             p = subprocess.check_output(["blkdiscard", save_path])
-        else:
+        else: # file
             p = subprocess.check_output(
                 ["truncate", "-s", "0", save_path])
             p = subprocess.check_output(
@@ -933,9 +979,10 @@ with open("/tmp/sparsebak/receive.lst","rb") as list:
 
 
 # Constants
-progversion = "0.2alpha2"
-topdir = "/sparsebak" # must be absolute path
-tmpdir = "/tmp/sparsebak"
+progversion = "0.2alphaXX"
+progname = "sparsebak"
+topdir = "/"+progname # must be absolute path
+tmpdir = "/tmp/"+progname
 volfile = tmpdir+"/volumes.txt"
 deltafile = tmpdir+"/delta."
 allvols = {}
@@ -954,7 +1001,7 @@ if os.getuid() > 0:
     exit(1)
 
 # Allow only one instance at a time
-lockpath = "/var/lock/sparsebak"
+lockpath = "/var/lock/"+progname
 try:
     lockf = open(lockpath, "w")
     fcntl.lockf(lockf, fcntl.LOCK_EX|fcntl.LOCK_NB)
